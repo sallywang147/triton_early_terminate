@@ -1,138 +1,115 @@
-import time
-import argparse
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from dataclasses import dataclass
-from scipy.stats import norm
 import torch
-import torch.nn as nn
 import triton
 import triton.language as tl
+import torch.nn as nn
 import torch.cuda.nvtx as nvtx
 
 
-# ============================================================
-# Triton Kernel: Early-Termination Linear
-# ============================================================
+# =============================
+# Triton Kernel (Baseline Matmul)
+# =============================
 
 @triton.jit
-def linear_baseline_kernel(
-    X_ptr, W_ptr, Y_ptr,
-    B, N, K,
-    stride_xb, stride_xk,
+def triton_linear_kernel(
+    X_ptr, W_ptr, B_ptr, Y_ptr,
+    B, DIN, DOUT,
+    stride_xm, stride_xk,
     stride_wn, stride_wk,
-    stride_yb, stride_yn,
+    stride_ym, stride_yn,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    Baseline matmul: y = x @ W^T
-    - X: [B, K]
-    - W: [N, K]
-    - Y: [B, N]
-    Each program handles one row b and BLOCK_N output channels.
-    No early termination, no stats, just full matmul.
-    """
-    b = tl.program_id(0)          # row index
-    n_block = tl.program_id(1)    # block index over N
+    pid_m = tl.program_id(0)   # batch row
+    pid_n = tl.program_id(1)   # output col block
 
-    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    n_mask = offs_n < N
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # initialize accumulator for BLOCK_N outputs
-    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    mask_m = offs_m < B
+    mask_n = offs_n < DOUT
 
-    # loop over K dimension in BLOCK_K chunks
-    for k0 in range(0, K, BLOCK_K):
-        k_ids = k0 + tl.arange(0, BLOCK_K)
-        k_mask = k_ids < K
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        # load X row slice: shape [BLOCK_K]
-        x_vals = tl.load(
-            X_ptr + b * stride_xb + k_ids * stride_xk,
-            mask=k_mask,
-            other=0.0,
-        )
+    for k in range(0, DIN, BLOCK_K):
 
-        # load W slice: shape [BLOCK_N, BLOCK_K]
-        w_vals = tl.load(
-            W_ptr + offs_n[:, None] * stride_wn + k_ids[None, :] * stride_wk,
-            mask=n_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
+        k_mask = (k + offs_k) < DIN
 
-        # accumulate dot product for each output lane n
-        prod = w_vals * x_vals[None, :]
-        acc += tl.sum(prod, axis=1)
+        x = tl.load(
+            X_ptr + offs_m[:, None] * stride_xm + (k + offs_k)[None, :] * stride_xk,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0
+        )  # [BLOCK_M, BLOCK_K]
 
-    # store result
+        w = tl.load(
+            W_ptr + offs_n[:, None] * stride_wn + (k + offs_k)[None, :] * stride_wk,
+            mask=mask_n[:, None] & k_mask[None, :],
+            other=0.0
+        )  # [BLOCK_N, BLOCK_K]
+
+        acc += tl.dot(x, tl.trans(w))
+
+    # Add bias
+    bias = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Store
     tl.store(
-        Y_ptr + b * stride_yb + offs_n * stride_yn,
+        Y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
         acc,
-        mask=n_mask,
+        mask=mask_m[:, None] & mask_n[None, :]
     )
+
+
+# =============================
+# Python Module Wrapper
+# =============================
 
 
 @triton.jit
 def linear_etu_kernel(
-    X_ptr, W_ptr, Y_ptr,
-    B, N, K,
-    tau, eps,
-    stride_xb, stride_xk,
+    X_ptr, W_ptr, B_ptr, Y_ptr,
+    B, DIN, DOUT,
+     stride_xm, stride_xk,
     stride_wn, stride_wk,
-    stride_yb, stride_yn,
-    K0: tl.constexpr,          # early-termination prefix length
-    MAX_ITERS: tl.constexpr,   # max tail iterations (compile-time)
+    stride_ym, stride_yn,
+          # early-termination prefix length   # max tail iterations (compile-time)
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    Computes y = x @ W^T with early termination on output lanes.
 
-    - X: (B, K)
-    - W: (N, K)  [out, in]
-    - Y: (B, N)
+    pid_m = tl.program_id(0)   # batch row
+    pid_n = tl.program_id(1)   # output col block
 
-    Phase 1: compute first K0 columns:
-        y1 = sum_{k < K0} x_k * w_k
-        s2 = sum_{k < K0} (x_k * w_k)^2
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    Confidence test per output element:
-        passed = |y1| / sqrt( s2 / K0 + eps ) > tau
+    mask_m = offs_m < B
+    mask_n = offs_n < 64
 
-    Phase 2: for outputs that did NOT pass, accumulate remaining columns
-        k ∈ [K0, K)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    Implementation constraints:
-      - No dynamic break/continue; loops are static in terms of K0, MAX_ITERS.
-      - Early termination is implemented via boolean masks on lanes.
-    """
-    # program ids
-    b = tl.program_id(0)               # row of X
-    n_block = tl.program_id(1)         # block across N
-
-    # N offsets for this block
-    n_offs = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    n_mask = n_offs < N
-
-    # ------------------------------------------------
-    # Phase 1: first K0 columns
-    # ------------------------------------------------
+    n_mask = offs_n < DOUT
     y1 = tl.zeros([BLOCK_N], dtype=tl.float32)
     s2 = tl.zeros([BLOCK_N], dtype=tl.float32)
+    K0 = 16
 
     for k0 in range(0, K0, BLOCK_K):
         k_ids = k0 + tl.arange(0, BLOCK_K)
         # Guard within [0, K0) and also within [0, K)
-        k_mask = (k_ids < K0) & (k_ids < K)
+        k_mask = (k_ids < K0) & (k_ids < BLOCK_K)
 
         x_vals = tl.load(
-            X_ptr + b * stride_xb + k_ids * stride_xk,
+            X_ptr + pid_m * stride_xm + k_ids * stride_xk,
             mask=k_mask,
             other=0.0,
         )
 
         w_vals = tl.load(
-            W_ptr + n_offs[:, None] * stride_wn + k_ids[None, :] * stride_wk,
+            W_ptr + offs_n[:, None] * stride_wn + k_ids[None, :] * stride_wk,
             mask=n_mask[:, None] & k_mask[None, :],
             other=0.0,
         )
@@ -141,473 +118,255 @@ def linear_etu_kernel(
         tmp = tl.sum(prod, axis=1)          # contribution to y1
         y1 += tmp
         s2 += tl.sum(prod * prod, axis=1)   # contribution to s2
+    tau = 0.02
 
-    # t-stat like confidence
-    denom = tl.sqrt(s2 / tl.maximum(K0, 1) + eps)
-    tstat = tl.abs(y1) / tl.maximum(denom, eps)
+    denom = tl.sqrt(s2 / K0 )
+    tstat = tl.abs(y1) / denom
     passed = (tstat < tau) & n_mask        # output lanes that pass ET
-    acc = y1                               # accumulator initialized with prefix sum
-
-    # ------------------------------------------------
-    # Phase 2: tail columns [K0, K) with masking
-    # ------------------------------------------------
-    # still_active = lanes that have NOT passed and are in-range
+    acc = y1  
     still_active = (~passed) & n_mask
+    for k0 in range(K0, DOUT, BLOCK_K):
+        k_ids = k0 + tl.arange(0, BLOCK_K)
+        k_mask = k_ids < DOUT
 
-    # We iterate a fixed MAX_ITERS times; each iteration handles a BLOCK_K chunk
-    for it in range(0, MAX_ITERS):
-        k = K0 + it * BLOCK_K
-        k_ids = k + tl.arange(0, BLOCK_K)
-        k_mask = k_ids < K       # only process within K
-
-        # Is this tail chunk even relevant? If k >= K, no work.
-        # But we cannot 'break', so just rely on k_mask to suppress loads.
-        lane_mask = still_active
-
-        # Load W only for active lanes & valid K
+        # If nothing is active, this will be masked out anyway
         w_vals = tl.load(
-            W_ptr + n_offs[:, None] * stride_wn + k_ids[None, :] * stride_wk,
-            mask=lane_mask[:, None] & k_mask[None, :],
+            W_ptr + k_ids[None, :] * stride_wk,
+            mask=still_active[:, None] & k_mask[None, :],
             other=0.0,
-        )
+        )                                       # [BLOCK_N, BLOCK_K]
 
-        # Load X if any lane is still active and k is valid.
-        any_active = tl.sum(lane_mask) > 0
+        any_active = tl.sum(still_active) > 0
         x_vals = tl.load(
-            X_ptr + b * stride_xb + k_ids * stride_xk,
+            X_ptr + k_ids * stride_xk,
             mask=k_mask & any_active,
             other=0.0,
-        )
+        )                                       # [BLOCK_K]
 
-        prod = w_vals * x_vals[None, :]
-        partial = tl.sum(prod, axis=1)
+        prod = w_vals * x_vals[None, :]         # [BLOCK_N, BLOCK_K]
+        partial = tl.sum(prod, axis=1)          # [BLOCK_N]
 
-        # Only accumulate for still-active lanes
-        acc += partial * lane_mask.to(tl.float32)
+        # ✅ acc stays 1D: [BLOCK_N]
+        acc += partial * still_active.to(tl.float32)
 
-    # Final output: passed lanes are zeroed (like your PyTorch code),
-    # others keep y1 + tail
+    # Add bias
     out = tl.where(passed, 0.0, acc)
     tl.store(
-        Y_ptr + b * stride_yb + n_offs * stride_yn,
+        Y_ptr + pid_m * stride_ym + offs_n * stride_yn,
         out,
         mask=n_mask,
     )
 
 
-# ============================================================
-# Python Wrapper: ET Matmul + Profiling
-# ============================================================
+# =============================
+# ET Triton linear: early termination on K0 prefix
+# =============================
 
-@dataclass
-class ETCallProfile:
-    elapsed_seconds: float
-    approx_cycles: float
-    total_flops: float
-    flops_linear: float
-    flops_confidence: float
-    est_memory_bytes: float
-    passed_ratio: float
+@triton.jit
+def triton_linear_et_kernel(
+    X_ptr, W_ptr, B_ptr, Y_ptr,
+    B, DIN, DOUT,                   # runtime scalars (float)
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_ym, stride_yn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,          # early-termination prefix length
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-class TritonEarlyTermMatmul:
-    """
-    Low-level callable:
+    mask_m = offs_m < B
+    mask_n = offs_n < DOUT
+    mask_mn = mask_m[:, None] & mask_n[None, :]
 
-        x: (B, K)
-        W: (N, K)  (stored on device)
-        y = x @ W^T with early termination on K0 prefix.
+    # Prefix accumulators (k in [0, K0))
+    acc_prefix = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    s2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    Uses `linear_etu_kernel` and also returns a profiling dict.
-    """
+    # --------------------------
+    # Phase 1: prefix [0, K0)
+    # --------------------------
+    # Assume K0 <= DIN; enforce in Python wrapper
+    for k in range(0, K0, BLOCK_K):
+        k_ids = k + offs_k
+        k_mask = (k_ids < DIN) & (k_ids < K0)
 
-    def __init__(
-        self,
-        weight: torch.Tensor,
-        early_k: int,
-        tau: float,
-        block_n: int = 128,
-        block_k: int = 64,
-        max_iters: int = 64,     # supports K up to early_k + max_iters * block_k
-        eps: float = 1e-6,
-    ):
-        assert weight.is_cuda, "Weight must be on CUDA."
-        self.weight = weight.contiguous()
-        self.N, self.K = self.weight.shape
-        self.K0 = early_k
-        self.tau = float(tau)
-        self.BLOCK_N = block_n
-        self.BLOCK_K = block_k
-        self.MAX_ITERS = max_iters
-        self.eps = float(eps)
+        x = tl.load(
+            X_ptr + offs_m[:, None] * stride_xm + k_ids[None, :] * stride_xk,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )  # [BLOCK_M, BLOCK_K]
 
-        max_supported_K = self.K0 + self.MAX_ITERS * self.BLOCK_K
-        if self.K > max_supported_K:
-            raise ValueError(
-                f"K={self.K} larger than supported max K={max_supported_K}. "
-                f"Increase max_iters or block_k."
-            )
+        w = tl.load(
+            W_ptr + offs_n[:, None] * stride_wn + k_ids[None, :] * stride_wk,
+            mask=mask_n[:, None] & k_mask[None, :],
+            other=0.0,
+        )  # [BLOCK_N, BLOCK_K]
 
-    @torch.no_grad()
-    def __call__(self, x_2d: torch.Tensor) -> tuple[torch.Tensor, ETCallProfile]:
-        """
-        x_2d: (B, K)  (last dim must match weight.K)
+        contrib = tl.dot(x, tl.trans(w))       # [BLOCK_M, BLOCK_N]
+        acc_prefix += contrib
+        s2 += contrib * contrib
 
-        Returns: (y, profile)
-          y: (B, N)  in float32 (caller can cast back)
-        """
-        assert x_2d.is_cuda
-        assert x_2d.ndim == 2 and x_2d.shape[1] == self.K
+    # Confidence test (t-like statistic)
+    denom = tl.sqrt(s2 / (K0 + eps) + eps)
+    tstat = tl.abs(acc_prefix) / tl.maximum(denom, eps)
 
-        B, K = x_2d.shape
-        N = self.N
+    passed = (tstat < tau) & mask_mn   # lanes that "pass" ET
+    acc = acc_prefix
 
-        y = torch.empty((B, N), device=x_2d.device, dtype=torch.float32)
+    # --------------------------
+    # Phase 2: tail [K0, DIN)
+    # --------------------------
+    for k in range(K0, DIN, BLOCK_K):
+        k_ids = k + offs_k
+        k_mask = k_ids < DIN
 
-        stride_xb, stride_xk = x_2d.stride()
-        stride_wn, stride_wk = self.weight.stride()
-        stride_yb, stride_yn = y.stride()
-
-        grid = (B, triton.cdiv(N, self.BLOCK_N))
-
-
-        t0 = time.perf_counter()
-        nvtx.range_push('etu')
-        linear_etu_kernel[grid](
-            x_2d, self.weight, y,
-            B, N, K,
-            self.tau, self.eps,
-            stride_xb, stride_xk,
-            stride_wn, stride_wk,
-            stride_yb, stride_yn,
-            K0=self.K0,
-            MAX_ITERS=self.MAX_ITERS,
-            BLOCK_N=self.BLOCK_N,
-            BLOCK_K=self.BLOCK_K,
-            num_warps=4,
-            num_stages=2,
+        x = tl.load(
+            X_ptr + offs_m[:, None] * stride_xm + k_ids[None, :] * stride_xk,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
         )
-        torch.cuda.synchronize()
-        nvtx.range_pop()
-        elapsed_s = time.perf_counter() - t0
 
-        # Host-side estimate of passed_ratio (same confidence rule on prefix)
-        with torch.no_grad():
-            x0 = x_2d[:, :self.K0].float()
-            w0 = self.weight[:, :self.K0].float()
-            y1 = x0 @ w0.t()
-            cum_sq = torch.zeros_like(y1)
-            # NOTE: this is O(K0) per call; that's fine for profiling / small K0.
-            for k_idx in range(self.K0):
-                tmp = (
-                    x_2d[:, k_idx : k_idx + 1]
-                    .float()
-                    @ self.weight[:, k_idx : k_idx + 1].float().t()
-                )
-                cum_sq += tmp.square_()
-            tstat = y1.abs() / torch.sqrt(cum_sq / max(self.K0, 1) + 1e-6)
-            passed_mask = tstat < self.tau
-            passed_ratio = passed_mask.float().mean().item()
-            remain_ratio = 1.0 - passed_ratio
-
-        # FLOPs model: prefix (K0) + remaining scaled by remain_ratio
-        macs_per_elem = self.K0 + remain_ratio * (K - self.K0)
-        flops_linear = 2.0 * macs_per_elem * (B * N)            # mul+add
-        flops_conf = (self.K0 * 2 + 6) * (B * N)                # rough overhead
-        total_flops = flops_linear + flops_conf
-
-        # Approx memory traffic (just for this matmul)
-        bytes_per = x_2d.element_size()
-        x_bytes = B * (self.K0 + remain_ratio * (K - self.K0)) * bytes_per
-        w_bytes = N * (self.K0 + remain_ratio * (K - self.K0)) * bytes_per
-        y_bytes = B * N * y.element_size()
-        est_traffic_bytes = x_bytes + w_bytes + y_bytes
-
-        props = torch.cuda.get_device_properties(x_2d.device)
-        sm_clock_hz = getattr(props, "clockRate", None)
-        if sm_clock_hz is None:
-            # fallback for older or vendor-specific builds
-            sm_clock_hz = getattr(props, "clock_rate", 0)
-        # convert kHz → Hz
-        sm_clock_hz = sm_clock_hz * 1e3
-
-        approx_cycles = elapsed_s * sm_clock_hz
-
-        profile = ETCallProfile(
-            elapsed_seconds=elapsed_s,
-            approx_cycles=approx_cycles,
-            total_flops=total_flops,
-            flops_linear=flops_linear,
-            flops_confidence=flops_conf,
-            est_memory_bytes=est_traffic_bytes,
-            passed_ratio=passed_ratio,
+        w = tl.load(
+            W_ptr + offs_n[:, None] * stride_wn + k_ids[None, :] * stride_wk,
+            mask=mask_n[:, None] & k_mask[None, :],
+            other=0.0,
         )
-        return y, profile
+
+        contrib = tl.dot(x, tl.trans(w))
+        active = (~passed).to(tl.float32)
+        acc += contrib * active
+
+    # Add bias
+    bias = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Final output: zero out passed lanes (like your MyLinear)
+    out = tl.where(passed, 0.0, acc)
+
+    tl.store(
+        Y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+        out,
+        mask=mask_mn,
+    )
 
 
-# ============================================================
-# nn.Linear wrapper + utils for patching a model
-# ============================================================
-
-@dataclass
-class ETStatsAccum:
-    calls: int = 0
-    elapsed_s: float = 0.0
-    est_mem_bytes: float = 0.0
-    passed_weighted_sum: float = 0.0
-    outputs_count: int = 0
-
-
-class TritonLinearModule(nn.Module):
-    """
-    Drop-in replacement for nn.Linear using TritonEarlyTermMatmul.
-
-    - Keeps original weight & bias (copied).
-    - Supports arbitrary batch/sequence dims: [..., K] → [..., N].
-    - Accumulates per-layer ET stats.
-    """
-
+class TritonLinearET(nn.Module):
     def __init__(
         self,
         linear: nn.Linear,
-        early_k: int = 256,
-        tau: float = 3.0,
-        block_n: int = 128,
-        block_k: int = 64,
-        max_iters: int = 64,
-        eps: float = 1e-6,
+
+        BLOCK_M: int = 32,
+        BLOCK_N: int = 64,
+        BLOCK_K: int = 32,
     ):
         super().__init__()
-        assert linear.weight.is_cuda, "Move model to CUDA before patching with Triton."
-        self.weight = nn.Parameter(linear.weight.detach().contiguous())
-        self.bias = (
-            nn.Parameter(linear.bias.detach())
-            if linear.bias is not None
-            else None
-        )
-        self.N, self.K = self.weight.shape
+        self.weight = linear.weight.detach().contiguous()
+        self.bias = linear.bias.detach().contiguous()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
 
-        self.op = TritonEarlyTermMatmul(
-            self.weight,
-            early_k=early_k,
-            tau=tau,
-            block_n=block_n,
-            block_k=block_k,
-            max_iters=max_iters,
-            eps=eps,
-        )
-        self.stats = ETStatsAccum()
+        self.BM = BLOCK_M
+        self.BN = BLOCK_N
+        self.BK = BLOCK_K
 
-    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_shape = x.shape
-        K = orig_shape[-1]
-        assert (
-            K == self.K
-        ), f"Input last dim {K} != weight K {self.K} in TritonLinearModule."
+        B, DIN = x.shape
+        assert DIN == self.in_features
 
-        x_2d = x.reshape(-1, K).contiguous()
-        y_2d, prof = self.op(x_2d)
-        if self.bias is not None:
-            y_2d = y_2d + self.bias
+        DOUT = self.out_features
+        y = torch.empty((B, DOUT), device=x.device, dtype=torch.float32)
 
-        # accumulate stats
-        self.stats.calls += 1
-        self.stats.elapsed_s += prof.elapsed_seconds
-        self.stats.est_mem_bytes += prof.est_memory_bytes
-        self.stats.passed_weighted_sum += prof.passed_ratio * y_2d.numel()
-        self.stats.outputs_count += y_2d.numel()
+        stride_xm, stride_xk = x.stride()
+        stride_wn, stride_wk = self.weight.stride()
+        stride_ym, stride_yn = y.stride()
 
-        y = y_2d.reshape(*orig_shape[:-1], self.N)
-        return y.to(x.dtype)
+        grid = (
+            triton.cdiv(B, self.BM),
+            triton.cdiv(DOUT, self.BN),
+        )
+    
+        linear_etu_kernel[grid](
+            x, self.weight, self.bias, y,
+            B, DIN, DOUT,
+            x.stride(0), x.stride(1),
+            self.weight.stride(0), self.weight.stride(1),
+            y.stride(0), y.stride(1),
+            BLOCK_M = self.BM,
+            BLOCK_N=self.BN,
+            BLOCK_K= self.BK,
+  
+        )
+
+        return y
 
 
-class MemoryTrackerModule(nn.Module):
-    """
-    Tracks REAL off-chip memory transfer for a Linear layer.
-    Handles both 2D ([N, D]) and 3D ([B, T, D]) input.
-    """
-    def __init__(self, module: nn.Module, name: str):
+
+class TritonLinear(nn.Module):
+    def __init__(self, linear, BLOCK_M=32, BLOCK_N=64, BLOCK_K=32):
         super().__init__()
-        self.module = module
-        self.name = name
-        self.bytes = 0
+        self.weight = linear.weight.detach().contiguous()
+        self.bias = linear.bias.detach().contiguous()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+
+        self.BM = BLOCK_M
+        self.BN = BLOCK_N
+        self.BK = BLOCK_K
 
     def forward(self, x):
-        W = self.module.weight
-        D_out, D_in = W.shape
-        dtype_size = x.element_size()
+        B, DIN = x.shape
+        DOUT = self.out_features
 
-        # --------------------------------------------
-        # CASE 1: x is [B, T, D]
-        # --------------------------------------------
-        if x.dim() == 3:
-            B, T, D = x.shape
-            assert D == D_in
-            N = B * T
+        y = torch.empty((B, DOUT), device=x.device, dtype=torch.float32)
 
-        # --------------------------------------------
-        # CASE 2: x is [N, D] (OPT MLP case!)
-        # --------------------------------------------
-        elif x.dim() == 2:
-            N, D = x.shape
-            assert D == D_in
+        grid = (
+            triton.cdiv(B, self.BM),
+            triton.cdiv(DOUT, self.BN)
+        )
 
-        # --------------------------------------------
-        # Unsupported shape
-        # --------------------------------------------
-        else:
-            raise ValueError(f"Unsupported input shape for Linear: {x.shape}")
+        triton_linear_kernel[grid](
+            x, self.weight, self.bias, y,
+            B, DIN, DOUT,
+            x.stride(0), x.stride(1),
+            self.weight.stride(0), self.weight.stride(1),
+            y.stride(0), y.stride(1),
+            BLOCK_M=self.BM, BLOCK_N=self.BN, BLOCK_K=self.BK,
+        )
 
-        # -------------------------------------------------------------
-        # Real off-chip memory traffic:
-        #   read_X = N * D
-        #   read_W = D_out * D
-        #   write_Y = N * D_out
-        # -------------------------------------------------------------
-        read_X  = N * D_in  * dtype_size
-        read_W  = D_out * D_in * dtype_size
-        write_Y = N * D_out * dtype_size
+        return y
 
-        self.bytes += (read_X + read_W + write_Y)
-        return self.module(x)
-
-
-
-def patch_model_with_triton(
-    model: nn.Module,
-    use_triton: bool = True,
-    early_k: int = 36,
-    tau: float = 0.02,
-    block_n: int = 128,
-    block_k: int = 64,
-    max_iters: int = 64,
-    eps: float = 1e-6,
-) -> nn.Module:
-    """
-    Recursively replace all nn.Linear modules with TritonLinearModule.
-    You can easily add a filter to restrict to certain submodules.
-    """
-    tracking_handles = []
-    tau = norm.ppf(tau)
-    if use_triton:
-        print("Using Triton ET kernel.")
-        for name, module in model.named_children():
-
-            # ONLY patch fc1 layers inside OPT decoder blocks
-            if name == "fc1" and isinstance(module, nn.Linear):
-                if use_triton:
-                    replaced = TritonLinearModule(
-                        module,
-                        early_k=early_k,
-                        tau=tau,
-                        block_n=block_n,
-                        block_k=block_k,
-                        max_iters=max_iters,
-                        eps=eps,
-                    )
-                else:
-                    replaced = module
-
-                wrapped = MemoryTrackerModule(replaced, name=f"fc1-{name}")
-
-            else:
-                    tracking_handles = patch_model_with_triton(
-                    module, use_triton=use_triton,
-                    early_k=early_k, tau=tau, block_n=block_n,
-                    block_k=block_k, max_iters=max_iters, eps=eps
-                )
-    else:
-        for name, module in model.named_children():
-          if name == "fc1" and isinstance(module, nn.Linear):
-              wrapped = MemoryTrackerModule(module, name=name)
-    return tracking_handles
-
-
-def collect_et_stats(model: nn.Module) -> ETStatsAccum:
-    """
-    Aggregate ET stats from all TritonLinearModule instances in a model.
-    """
-    agg = ETStatsAccum()
-    for m in model.modules():
-        if isinstance(m, TritonLinearModule):
-            agg.calls += m.stats.calls
-            agg.elapsed_s += m.stats.elapsed_s
-            agg.est_mem_bytes += m.stats.est_mem_bytes
-            agg.passed_weighted_sum += m.stats.passed_weighted_sum
-            agg.outputs_count += m.stats.outputs_count
-    return agg
-
-
-
-
-# ============================================================
-# Main profiling entrypoint
-# ============================================================
-
-EARLY_K = 256
-TAU = 0.02        # probability → converted to z-score
-BLOCK_N = 128
-BLOCK_K = 64
-MAX_ITERS = 64
-
+# =============================
+# Test
+# =============================
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--et",
-        action="store_true",
-        help="Use early termination Triton kernel (otherwise pure baseline matmul).",
-    )
-    args = parser.parse_args()
+    torch.manual_seed(0)
+    layer = nn.Linear(32, 64).cuda().float()
+    #tri = TritonLinear(layer).cuda()
+    tri_et = TritonLinearET(layer).cuda()
 
-    device = "cuda"
-    model_name = "facebook/opt-125m"
 
-    print(f"Loading {model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        device_map=device,
-    )
-    model.eval()
+    x = torch.randn(16, 32, device="cuda", dtype=torch.float32)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    #y_ref = layer(x)
 
-    print("Patching OPT-125M Linear layers with Triton ET kernel...")
-    patch_model_with_triton(
-        model,
-        early_k=EARLY_K,
-        tau=TAU,
-        block_n=BLOCK_N,
-        block_k=BLOCK_K,
-        max_iters=MAX_ITERS,
-    )
-    text = "What is the capital of France?"
-    inputs = tokenizer(text, return_tensors="pt").to(device)
+    #y_tri = tri(x)
 
     
-
-    # Warmup (not profiled)
-    print("Warmup...")
-    with torch.no_grad():
-        for _ in range(3):
-            _ = model(**inputs)
-
-    label = "ET" if args.et else "BASELINE"
-    print("Profiling label:", label)
-
-    # 🔴 Nsight Compute should capture this region
-    nvtx.range_push("ET")
-    with torch.no_grad():
-        out = model(**inputs)
+    y_early = tri_et(x)
     torch.cuda.synchronize()
-    nvtx.range_pop()
+    
 
-    print("Done. Logits mean:", out.logits.float().mean().item())
+
+    #print(f"val: {y}")
 
 
 if __name__ == "__main__":
     main()
-
-
+   
