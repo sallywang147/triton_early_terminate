@@ -1,0 +1,43 @@
+==PROF== Connected to process 34210 (/usr/bin/python3.12)
+==PROF== Profiling "distribution_elementwise_grid..." - 0: 0%....50%....100% - 1 pass
+==PROF== Profiling "gemmSN_TN_kernel" - 1: 0%....50%....100% - 1 pass
+==PROF== Profiling "triton_linear_kernel" - 2: 0%....50%....100% - 1 pass
+==PROF== Profiling "linear_etu_kernel" - 3: 0%....50%....100% - 1 pass
+==PROF== Disconnected from process 34210
+[34210] python3.12@127.0.0.1
+  void at::<unnamed>::distribution_elementwise_grid_stride_kernel<float, 4, void at::normal_and_transform<float, float, at::CUDAGeneratorImpl *, void at::normal_kernel<at::CUDAGeneratorImpl *>(const at::TensorBase &, double, double, T1)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 2)]::operator ()() const::[lambda(float) (instance 1)]>(at::TensorIteratorBase &, T3, T4)::[lambda(curandStatePhilox4_32_10 *) (instance 2)], void at::<unnamed>::distribution_nullary_kernel<float, float, float4, at::CUDAGeneratorImpl *, void at::normal_and_transform<float, float, at::CUDAGeneratorImpl *, void at::normal_kernel<at::CUDAGeneratorImpl *>(const at::TensorBase &, double, double, T1)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 2)]::operator ()() const::[lambda(float) (instance 1)]>(at::TensorIteratorBase &, T3, T4)::[lambda(curandStatePhilox4_32_10 *) (instance 2)], void at::normal_kernel<at::CUDAGeneratorImpl *>(const at::TensorBase &, double, double, T1)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 2)]::operator ()() const::[lambda(float) (instance 1)]>(at::TensorIteratorBase &, T4, const T5 &, T6)::[lambda(int, float) (instance 1)]>(long, at::PhiloxCudaState, T3, T4) (2, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.0
+    Section: Command line profiler metrics
+    --------------------- ----------- ------------
+    Metric Name           Metric Unit Metric Value
+    --------------------- ----------- ------------
+    dram__bytes_read.sum        Kbyte        10.24
+    dram__bytes_write.sum        byte            0
+    --------------------- ----------- ------------
+
+  void gemmSN_TN_kernel<float, 128, 16, 2, 4, 8, 9, 0, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<float>>(cublasGemmSmallNParams<T9, T10, T11, T1>) (8, 2, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 8.0
+    Section: Command line profiler metrics
+    --------------------- ----------- ------------
+    Metric Name           Metric Unit Metric Value
+    --------------------- ----------- ------------
+    dram__bytes_read.sum        Kbyte        25.60
+    dram__bytes_write.sum        byte            0
+    --------------------- ----------- ------------
+
+  triton_linear_kernel (1, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 8.0
+    Section: Command line profiler metrics
+    --------------------- ----------- ------------
+    Metric Name           Metric Unit Metric Value
+    --------------------- ----------- ------------
+    dram__bytes_read.sum        Kbyte        19.07
+    dram__bytes_write.sum        byte            0
+    --------------------- ----------- ------------
+
+  linear_etu_kernel (1, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 8.0
+    Section: Command line profiler metrics
+    --------------------- ----------- ------------
+    Metric Name           Metric Unit Metric Value
+    --------------------- ----------- ------------
+    dram__bytes_read.sum        Kbyte        12.80
+    dram__bytes_write.sum        byte            0
+    --------------------- ----------- ------------
+

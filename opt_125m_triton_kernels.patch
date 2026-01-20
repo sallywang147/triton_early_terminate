@@ -1,0 +1,491 @@
+--- a/profile_triton.py
++++ b/profile_triton.py
+@@ -1,6 +1,7 @@
+ #working version: be sure to install requirements in requirements.txt
+ import os
+ import torch, math
++import torch.nn.functional as F
+ import triton
+ import triton.language as tl
+ import torch.nn as nn
+@@ -233,6 +234,319 @@ class TritonLinear(nn.Module):
+         return y
+ 
+ # =============================
++# OPT-Specific Adaptations
++# =============================
++
++"""
++OPT 125M architecture:
++- hidden_dim = 768
++- num_heads = 12
++- head_dim = hidden_dim // num_heads = 64
++- FC1 (feed-forward first): 768 -> 3072
++- FC2 (feed-forward second): 3072 -> 768
++- Q, K, V projections: each 768 -> 768 (can be fused as 768 -> 2304)
++- Out projection: 768 -> 768
++"""
++
++@triton.jit
++def triton_linear_kernel_opt_fc1(
++    X_ptr, W_ptr, B_ptr, Y_ptr,
++    B, DIN, DOUT,
++    stride_xm, stride_xk,
++    stride_wn, stride_wk,
++    stride_ym, stride_yn,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    use_gelu: tl.constexpr = False,
++):
++    """
++    Triton kernel for OPT FC1 layer (768 -> 3072).
++    Includes optional GELU activation (applied post-bias).
++    """
++    pid_m = tl.program_id(0)   # batch row
++    pid_n = tl.program_id(1)   # output col block
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++
++    mask_m = offs_m < B
++    mask_n = offs_n < DOUT
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++
++    for k in range(0, DIN, BLOCK_K):
++        k_mask = (k + offs_k) < DIN
++
++        x = tl.load(
++            X_ptr + offs_m[:, None] * stride_xm + (k + offs_k)[None, :] * stride_xk,
++            mask=mask_m[:, None] & k_mask[None, :],
++            other=0.0
++        )  # [BLOCK_M, BLOCK_K]
++
++        w = tl.load(
++            W_ptr + offs_n[:, None] * stride_wn + (k + offs_k)[None, :] * stride_wk,
++            mask=mask_n[:, None] & k_mask[None, :],
++            other=0.0
++        )  # [BLOCK_N, BLOCK_K]
++
++        acc += tl.dot(x, tl.trans(w))
++
++    # Add bias
++    bias = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
++    acc += bias[None, :]
++
++    # Apply GELU if requested (approximate)
++    if use_gelu:
++        acc = 0.5 * acc * (1.0 + tl.tanh(tl.sqrt(2.0 / 3.14159265) * (acc + 0.044715 * acc * acc * acc)))
++
++    # Store
++    tl.store(
++        Y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
++        acc,
++        mask=mask_m[:, None] & mask_n[None, :]
++    )
++
++
++@triton.jit
++def triton_linear_kernel_opt_qkv(
++    X_ptr, W_ptr, B_ptr, Y_ptr,
++    B, DIN, DOUT,
++    stride_xm, stride_xk,
++    stride_wn, stride_wk,
++    stride_ym, stride_yn,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    """
++    Triton kernel for OPT Q/K/V or output projection (768 -> 768 or 768 -> 2304 fused).
++    No activation applied (already in matmul-only form).
++    """
++    pid_m = tl.program_id(0)   # batch row
++    pid_n = tl.program_id(1)   # output col block
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++
++    mask_m = offs_m < B
++    mask_n = offs_n < DOUT
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++
++    for k in range(0, DIN, BLOCK_K):
++        k_mask = (k + offs_k) < DIN
++
++        x = tl.load(
++            X_ptr + offs_m[:, None] * stride_xm + (k + offs_k)[None, :] * stride_xk,
++            mask=mask_m[:, None] & k_mask[None, :],
++            other=0.0
++        )  # [BLOCK_M, BLOCK_K]
++
++        w = tl.load(
++            W_ptr + offs_n[:, None] * stride_wn + (k + offs_k)[None, :] * stride_wk,
++            mask=mask_n[:, None] & k_mask[None, :],
++            other=0.0
++        )  # [BLOCK_N, BLOCK_K]
++
++        acc += tl.dot(x, tl.trans(w))
++
++    # Add bias
++    bias = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
++    acc += bias[None, :]
++
++    # Store
++    tl.store(
++        Y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
++        acc,
++        mask=mask_m[:, None] & mask_n[None, :]
++    )
++
++
++@triton.jit
++def linear_etu_kernel_opt_fc1(
++    X_ptr, W_ptr, B_ptr, Y_ptr,
++    B, DIN, DOUT, K0,
++    stride_xm, stride_xk,
++    stride_wn, stride_wk,
++    stride_ym, stride_yn,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    use_gelu: tl.constexpr = False,
++):
++    """
++    Early-termination kernel for OPT FC1 (768 -> 3072).
++    - Prefix accumulation in [0, K0)
++    - Confidence test on prefix
++    - Tail accumulation in [K0, DIN) only for active lanes
++    - Optional GELU activation post-bias
++    """
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++
++    mask_m = offs_m < B
++    mask_n = offs_n < DOUT
++    mask_mn = mask_m[:, None] & mask_n[None, :]
++
++    # Prefix accumulators
++    acc_prefix = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    s2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++
++    eps = 1e-10
++    tau = -2.053748910631823  # two-tailed 95% confidence for t-test
++
++    # Phase 1: prefix [0, K0)
++    for k in range(0, K0, BLOCK_K):
++        k_ids = k + offs_k
++        k_mask = (k_ids < DIN) & (k_ids < K0)
++
++        x = tl.load(
++            X_ptr + offs_m[:, None] * stride_xm + k_ids[None, :] * stride_xk,
++            mask=mask_m[:, None] & k_mask[None, :],
++            other=0.0,
++        )
++
++        w = tl.load(
++            W_ptr + offs_n[:, None] * stride_wn + k_ids[None, :] * stride_wk,
++            mask=mask_n[:, None] & k_mask[None, :],
++            other=0.0,
++        )
++
++        contrib = tl.dot(x, tl.trans(w))
++        acc_prefix += contrib
++        s2 += contrib * contrib
++
++    # Confidence test
++    denom = tl.sqrt(s2 / (K0 + eps) + eps)
++    tstat = tl.abs(acc_prefix) / tl.maximum(denom, eps)
++    passed = (tstat < tau) & mask_mn
++    acc = acc_prefix
++
++    # Phase 2: tail [K0, DIN)
++    for k in range(K0, DIN, BLOCK_K):
++        k_ids = k + offs_k
++        k_mask = k_ids < DIN
++
++        x = tl.load(
++            X_ptr + offs_m[:, None] * stride_xm + k_ids[None, :] * stride_xk,
++            mask=mask_m[:, None] & k_mask[None, :],
++            other=0.0,
++        )
++
++        w = tl.load(
++            W_ptr + offs_n[:, None] * stride_wn + k_ids[None, :] * stride_wk,
++            mask=mask_n[:, None] & k_mask[None, :],
++            other=0.0,
++        )
++
++        contrib = tl.dot(x, tl.trans(w))
++        active = (~passed).to(tl.float32)
++        acc += contrib * active
++
++    # Add bias
++    bias = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
++    acc += bias[None, :]
++
++    # Apply GELU if requested
++    if use_gelu:
++        acc = 0.5 * acc * (1.0 + tl.tanh(tl.sqrt(2.0 / 3.14159265) * (acc + 0.044715 * acc * acc * acc)))
++
++    # Zero out passed lanes
++    out = tl.where(passed, 0.0, acc)
++
++    tl.store(
++        Y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
++        out,
++        mask=mask_mn,
++    )
++
++
++@triton.jit
++def linear_etu_kernel_opt_qkv(
++    X_ptr, W_ptr, B_ptr, Y_ptr,
++    B, DIN, DOUT, K0,
++    stride_xm, stride_xk,
++    stride_wn, stride_wk,
++    stride_ym, stride_yn,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    """
++    Early-termination kernel for OPT Q/K/V or output projection (768 -> 768/2304).
++    Identical structure to FC1 but without activation.
++    """
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++
++    mask_m = offs_m < B
++    mask_n = offs_n < DOUT
++    mask_mn = mask_m[:, None] & mask_n[None, :]
++
++    acc_prefix = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    s2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++
++    eps = 1e-10
++    tau = -2.053748910631823
++
++    # Phase 1: prefix [0, K0)
++    for k in range(0, K0, BLOCK_K):
++        k_ids = k + offs_k
++        k_mask = (k_ids < DIN) & (k_ids < K0)
++
++        x = tl.load(
++            X_ptr + offs_m[:, None] * stride_xm + k_ids[None, :] * stride_xk,
++            mask=mask_m[:, None] & k_mask[None, :],
++            other=0.0,
++        )
++
++        w = tl.load(
++            W_ptr + offs_n[:, None] * stride_wn + k_ids[None, :] * stride_wk,
++            mask=mask_n[:, None] & k_mask[None, :],
++            other=0.0,
++        )
++
++        contrib = tl.dot(x, tl.trans(w))
++        acc_prefix += contrib
++        s2 += contrib * contrib
++
++    # Confidence test
++    denom = tl.sqrt(s2 / (K0 + eps) + eps)
++    tstat = tl.abs(acc_prefix) / tl.maximum(denom, eps)
++    passed = (tstat < tau) & mask_mn
++    acc = acc_prefix
++
++    # Phase 2: tail [K0, DIN)
++    for k in range(K0, DIN, BLOCK_K):
++        k_ids = k + offs_k
++        k_mask = k_ids < DIN
++
++        x = tl.load(
++            X_ptr + offs_m[:, None] * stride_xm + k_ids[None, :] * stride_xk,
++            mask=mask_m[:, None] & k_mask[None, :],
++            other=0.0,
++        )
++
++        w = tl.load(
++            W_ptr + offs_n[:, None] * stride_wn + k_ids[None, :] * stride_wk,
++            mask=mask_n[:, None] & k_mask[None, :],
++            other=0.0,
++        )
++
++        contrib = tl.dot(x, tl.trans(w))
++        active = (~passed).to(tl.float32)
++        acc += contrib * active
++
++    # Add bias
++    bias = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
++    acc += bias[None, :]
++
++    # Zero out passed lanes
++    out = tl.where(passed, 0.0, acc)
++
++    tl.store(
++        Y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
++        out,
++        mask=mask_mn,
++    )
++
++
++class TritonLinearOptFC1(nn.Module):
++    """
++    OPT FC1 layer using Triton (768 -> 3072 with GELU).
++    """
++    def __init__(self, linear, BLOCK_M=32, BLOCK_N=128, BLOCK_K=32, use_gelu=True):
++        super().__init__()
++        self.weight = linear.weight.detach().contiguous()
++        self.bias = linear.bias.detach().contiguous()
++        self.in_features = linear.in_features
++        self.out_features = linear.out_features
++        self.use_gelu = use_gelu
++
++        self.BM = BLOCK_M
++        self.BN = BLOCK_N
++        self.BK = BLOCK_K
++
++    def forward(self, x):
++        B, DIN = x.shape
++        DOUT = self.out_features
++
++        y = torch.empty((B, DOUT), device=x.device, dtype=torch.float32)
++
++        grid = (triton.cdiv(B, self.BM), triton.cdiv(DOUT, self.BN))
++
++        triton_linear_kernel_opt_fc1[grid](
++            x, self.weight, self.bias, y,
++            B, DIN, DOUT,
++            x.stride(0), x.stride(1),
++            self.weight.stride(0), self.weight.stride(1),
++            y.stride(0), y.stride(1),
++            BLOCK_M=self.BM, BLOCK_N=self.BN, BLOCK_K=self.BK,
++            use_gelu=self.use_gelu,
++        )
++
++        return y
++
++
++class TritonLinearOptQKV(nn.Module):
++    """
++    OPT Q/K/V or output projection using Triton (768 -> 768 or 768 -> 2304 fused).
++    """
++    def __init__(self, linear, BLOCK_M=32, BLOCK_N=128, BLOCK_K=32):
++        super().__init__()
++        self.weight = linear.weight.detach().contiguous()
++        self.bias = linear.bias.detach().contiguous()
++        self.in_features = linear.in_features
++        self.out_features = linear.out_features
++
++        self.BM = BLOCK_M
++        self.BN = BLOCK_N
++        self.BK = BLOCK_K
++
++    def forward(self, x):
++        B, DIN = x.shape
++        DOUT = self.out_features
++
++        y = torch.empty((B, DOUT), device=x.device, dtype=torch.float32)
++
++        grid = (triton.cdiv(B, self.BM), triton.cdiv(DOUT, self.BN))
++
++        triton_linear_kernel_opt_qkv[grid](
++            x, self.weight, self.bias, y,
++            B, DIN, DOUT,
++            x.stride(0), x.stride(1),
++            self.weight.stride(0), self.weight.stride(1),
++            y.stride(0), y.stride(1),
++            BLOCK_M=self.BM, BLOCK_N=self.BN, BLOCK_K=self.BK,
++        )
++
++        return y
++
++
++class TritonLinearETOptFC1(nn.Module):
++    """
++    OPT FC1 with early termination (768 -> 3072, GELU applied in kernel).
++    """
++    def __init__(self, linear, K0=256, BLOCK_M=32, BLOCK_N=128, BLOCK_K=32, use_gelu=True):
++        super().__init__()
++        self.weight = linear.weight.detach().contiguous()
++        self.bias = linear.bias.detach().contiguous()
++        self.in_features = linear.in_features
++        self.out_features = linear.out_features
++        self.K0 = K0
++        self.use_gelu = use_gelu
++
++        self.BM = BLOCK_M
++        self.BN = BLOCK_N
++        self.BK = BLOCK_K
++
++    def forward(self, x):
++        B, DIN = x.shape
++        DOUT = self.out_features
++
++        y = torch.empty((B, DOUT), device=x.device, dtype=torch.float32)
++
++        grid = (triton.cdiv(B, self.BM), triton.cdiv(DOUT, self.BN))
++
++        linear_etu_kernel_opt_fc1[grid](
++            x, self.weight, self.bias, y,
++            B, DIN, DOUT, self.K0,
++            x.stride(0), x.stride(1),
++            self.weight.stride(0), self.weight.stride(1),
++            y.stride(0), y.stride(1),
++            BLOCK_M=self.BM, BLOCK_N=self.BN, BLOCK_K=self.BK,
++            use_gelu=self.use_gelu,
++        )
++
++        return y
++
++
++class TritonLinearETOptQKV(nn.Module):
++    """
++    OPT Q/K/V or output projection with early termination (768 -> 768/2304).
++    """
++    def __init__(self, linear, K0=256, BLOCK_M=32, BLOCK_N=128, BLOCK_K=32):
++        super().__init__()
++        self.weight = linear.weight.detach().contiguous()
++        self.bias = linear.bias.detach().contiguous()
++        self.in_features = linear.in_features
++        self.out_features = linear.out_features
++        self.K0 = K0
++
++        self.BM = BLOCK_M
++        self.BN = BLOCK_N
++        self.BK = BLOCK_K
++
++    def forward(self, x):
++        B, DIN = x.shape
++        DOUT = self.out_features
++
++        y = torch.empty((B, DOUT), device=x.device, dtype=torch.float32)
++
++        grid = (triton.cdiv(B, self.BM), triton.cdiv(DOUT, self.BN))
++
++        linear_etu_kernel_opt_qkv[grid](
++            x, self.weight, self.bias, y,
++            B, DIN, DOUT, self.K0,
++            x.stride(0), x.stride(1),
++            self.weight.stride(0), self.weight.stride(1),
++            y.stride(0), y.stride(1),
++            BLOCK_M=self.BM, BLOCK_N=self.BN, BLOCK_K=self.BK,
++        )
++
++        return y
++
++
+ # Test
+ # =============================
+ 

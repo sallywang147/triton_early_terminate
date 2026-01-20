@@ -1,9 +1,11 @@
-import torch
+#working version: be sure to install requirements in requirements.txt
+import os
+import torch, math
 import triton
 import triton.language as tl
 import torch.nn as nn
 import torch.cuda.nvtx as nvtx
-
+from scipy.stats import norm
 
 # =============================
 # Triton Kernel (Baseline Matmul)
@@ -66,15 +68,16 @@ def triton_linear_kernel(
 # Python Module Wrapper
 # =============================
 
+ # two-tailed 95% confidence
 
 @triton.jit
 def linear_etu_kernel(
     X_ptr, W_ptr, B_ptr, Y_ptr,
-    B, DIN, DOUT,
+    B, DIN, DOUT, 
      stride_xm, stride_xk,
     stride_wn, stride_wk,
     stride_ym, stride_yn,
-          # early-termination prefix length   # max tail iterations (compile-time)
+          # early-termination prefix length   # max tail iterations (compile-time) 
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -118,8 +121,7 @@ def linear_etu_kernel(
         tmp = tl.sum(prod, axis=1)          # contribution to y1
         y1 += tmp
         s2 += tl.sum(prod * prod, axis=1)   # contribution to s2
-    tau = 0.02
-
+    tau = -2.053748910631823
     denom = tl.sqrt(s2 / K0 )
     tstat = tl.abs(y1) / denom
     passed = (tstat < tau) & n_mask        # output lanes that pass ET
@@ -348,15 +350,15 @@ class TritonLinear(nn.Module):
 def main():
     torch.manual_seed(0)
     layer = nn.Linear(32, 64).cuda().float()
-    #tri = TritonLinear(layer).cuda()
+    tri = TritonLinear(layer).cuda()
     tri_et = TritonLinearET(layer).cuda()
 
 
     x = torch.randn(16, 32, device="cuda", dtype=torch.float32)
 
-    #y_ref = layer(x)
+    y_ref = layer(x)
 
-    #y_tri = tri(x)
+    y_tri = tri(x)
 
     
     y_early = tri_et(x)
@@ -369,4 +371,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-   
