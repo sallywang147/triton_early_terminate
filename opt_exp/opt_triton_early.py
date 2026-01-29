@@ -1,3 +1,4 @@
+
 import torch
 import triton
 import triton.language as tl
@@ -230,7 +231,7 @@ def eval_piqa(model, tokenizer, dataset, max_len=256):
     correct = 0
 
     # ---- evaluate only the first 10 samples ----
-    n = min(2000, len(dataset))
+    n = min(1, len(dataset))
     subset = dataset.select(range(n))
 
     for item in tqdm.tqdm(subset, desc="Evaluating"):
@@ -358,50 +359,119 @@ def eval_end_to_end_three_way(
 
 
 @triton.jit
-def linear_fwd_kernel(
+def linear_fwd_kernel_gated_rows(
     X_ptr, W_ptr, B_ptr, O_ptr,
-    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    stride_xm, stride_xk,
-    stride_wn, stride_wk,
-    stride_om, stride_on,
+    ROWIDX_ptr,                         # [M2] int32, compact -> original row
+    M2: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_xm: tl.constexpr, stride_xk: tl.constexpr,
+    stride_wn: tl.constexpr, stride_wk: tl.constexpr,
+    stride_om: tl.constexpr, stride_on: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    OUT_TL_DTYPE: tl.constexpr,   # <- must be tl.float16 / tl.bfloat16 / tl.float32
+    OUT_TL_DTYPE: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_m = tl.program_id(0)   # over compact rows
+    pid_n = tl.program_id(1)   # over N tiles
 
-    rm = pid_m * BM + tl.arange(0, BM)
-    rn = pid_n * BN + tl.arange(0, BN)
-    rk = tl.arange(0, BK)
+    rid = pid_m * BM + tl.arange(0, BM)        # indices into ROWIDX
+    rn  = pid_n * BN + tl.arange(0, BN)        # cols
+    rk  = tl.arange(0, BK)
 
-    x_ptrs = X_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk
+    mask_r = rid < M2
+    row = tl.load(ROWIDX_ptr + rid, mask=mask_r, other=0).to(tl.int32)  # [BM]
+
+    # pointers for X block: [BM, BK] but using original rows
+    x_ptrs = X_ptr + row[:, None] * stride_xm + rk[None, :] * stride_xk
+    # pointers for W block: W is [N, K]
     w_ptrs = W_ptr + rn[None, :] * stride_wn + rk[:, None] * stride_wk
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
 
-    # K is constexpr, so this loop is compile-time unrolled in blocks
     for k0 in tl.static_range(0, K, BK):
         k = k0 + rk
+
         x = tl.load(
             x_ptrs + k0 * stride_xk,
-            mask=(rm[:, None] < M) & (k[None, :] < K),
-            other=0.0
+            mask=mask_r[:, None] & (k[None, :] < K),
+            other=0.0,
         ).to(tl.float32)
+
         w = tl.load(
             w_ptrs + k0 * stride_wk,
             mask=(rn[None, :] < N) & (k[:, None] < K),
-            other=0.0
+            other=0.0,
         ).to(tl.float32)
 
         acc += tl.dot(x, w)
 
     if HAS_BIAS:
-        b = tl.load(B_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+        b = tl.load(B_ptr + rn, mask=(rn < N), other=0.0).to(tl.float32)
         acc += b[None, :]
 
-    o_ptrs = O_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on
-    tl.store(o_ptrs, acc.to(OUT_TL_DTYPE), mask=(rm[:, None] < M) & (rn[None, :] < N))
+    # store into original row locations
+    o_ptrs = O_ptr + row[:, None] * stride_om + rn[None, :] * stride_on
+    tl.store(o_ptrs, acc.to(OUT_TL_DTYPE), mask=mask_r[:, None] & (rn[None, :] < N))
+
+
+def triton_linear_fwd_dense_masked_rows(
+    x_mk: torch.Tensor,               # [M, K]
+    w_nk: torch.Tensor,               # [N, K]
+    row_mask_m: torch.Tensor,         # [M] bool; True => compute this row, False => keep 0
+    bias: torch.Tensor | None = None,
+    out_dtype=None,
+    BM=128, BN=128, BK=32,
+    num_warps=8, num_stages=3,
+):
+    """
+    Efficient version after you have masks:
+      - builds compact row index list for rows where row_mask_m is True
+      - runs GEMM only for those rows (same weight for all)
+      - writes results back to O at the original row positions
+      - leaves other rows as 0
+
+    Returns:
+      O: [M, N]
+      row_idx: [M2] int32 compacted rows used
+    """
+    assert x_mk.is_cuda and w_nk.is_cuda
+    assert x_mk.ndim == 2 and w_nk.ndim == 2
+    M, K = x_mk.shape
+    N, K2 = w_nk.shape
+    assert K == K2
+    assert row_mask_m.is_cuda and row_mask_m.ndim == 1 and row_mask_m.numel() == M
+
+    if bias is not None:
+        assert bias.is_cuda and bias.ndim == 1 and bias.numel() == N
+
+    if out_dtype is None:
+        out_dtype = x_mk.dtype
+    out_tl = _TORCH_TO_TL[out_dtype]
+
+    # Compact rows
+    row_idx = row_mask_m.nonzero(as_tuple=False).squeeze(1).to(torch.int32)
+    M2 = int(row_idx.numel())
+
+    # Output is zero for rows not computed
+    o = torch.zeros((M, N), device=x_mk.device, dtype=out_dtype)
+
+    if M2 == 0:
+        return o, row_idx
+
+    grid = (triton.cdiv(M2, BM), triton.cdiv(N, BN))
+
+    linear_fwd_kernel_gated_rows[grid](
+        x_mk, w_nk, bias, o,
+        row_idx,
+        M2=M2, N=N, K=K,
+        stride_xm=x_mk.stride(0), stride_xk=x_mk.stride(1),
+        stride_wn=w_nk.stride(0), stride_wk=w_nk.stride(1),
+        stride_om=o.stride(0),    stride_on=o.stride(1),
+        HAS_BIAS=(bias is not None),
+        OUT_TL_DTYPE=out_tl,
+        BM=BM, BN=BN, BK=BK,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return o, row_idx
 
 
 @triton.jit
@@ -890,6 +960,89 @@ def torch_gated_output_ref(
     return y_ref
 
 
+import triton
+import triton.language as tl
+
+@triton.jit
+def linear_fwd_kernel_fast(
+    X_ptr, W_ptr, B_ptr, O_ptr,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,   # W is [N,K] (torch), stride_wn=stride(0), stride_wk=stride(1)
+    stride_om, stride_on,
+    HAS_BIAS: tl.constexpr,
+    OUT_TL_DTYPE: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    # 2D launch: (pid_m, pid_n) packed into 1D pid with GROUP_M swizzle
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+
+    pid_group = pid // (GROUP_M * grid_n)
+    first_m = pid_group * GROUP_M
+    pid_in_group = pid - pid_group * GROUP_M * grid_n
+    pid_m = first_m + (pid_in_group % GROUP_M)
+    pid_n = (pid_in_group // GROUP_M)
+
+    # Guard against out-of-range pid_m
+    if pid_m >= grid_m:
+        return
+
+    # Block pointers (better pipelining / vectorization)
+    # X block: [BLOCK_M, K]
+    x_blk = tl.make_block_ptr(
+        base=X_ptr,
+        shape=(M, K),
+        strides=(stride_xm, stride_xk),
+        offsets=(pid_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(1, 0),  # load K contiguous
+    )
+
+    # W is [N,K], but we need W^T in dot. We'll load a [BLOCK_N, BLOCK_K] tile from W
+    w_blk = tl.make_block_ptr(
+        base=W_ptr,
+        shape=(N, K),
+        strides=(stride_wn, stride_wk),
+        offsets=(pid_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, BLOCK_K),
+        order=(1, 0),
+    )
+
+    # accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K loop
+    # Tip: if K is always multiple of BLOCK_K, this is mask-free in the inner loop
+    for k0 in tl.static_range(0, K, BLOCK_K):
+        x = tl.load(x_blk, boundary_check=(0, 1)).to(tl.float16 if OUT_TL_DTYPE != tl.float32 else tl.float32)
+        w = tl.load(w_blk, boundary_check=(0, 1)).to(tl.float16 if OUT_TL_DTYPE != tl.float32 else tl.float32)
+
+        # w is [BLOCK_N, BLOCK_K], but tl.dot expects [BLOCK_M,BLOCK_K] x [BLOCK_K,BLOCK_N]
+        # so we transpose w in registers
+        acc += tl.dot(x, tl.trans(w))
+
+        # advance block pointers along K
+        x_blk = tl.advance(x_blk, (0, BLOCK_K))
+        w_blk = tl.advance(w_blk, (0, BLOCK_K))
+
+    # bias
+    if HAS_BIAS:
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        b = tl.load(B_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+        acc += b[None, :]
+
+    # store
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    o_ptrs = O_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on
+    mask = (rm[:, None] < M) & (rn[None, :] < N)
+    tl.store(o_ptrs, acc.to(OUT_TL_DTYPE), mask=mask)
+
+
 @torch.no_grad()
 def check_y_triton_vs_torch(
     x_mk,
@@ -1067,11 +1220,59 @@ def check_opt_layerwise_gated_tail_triton_vs_torch(
             y1_tri.float(), cs_tri.float(),
             weight, bias,
             n=E,
-            test_stat_bound=test_stat_bound,
-        )
+            test_stat_bound=test_stat_bound,)
 
 
-def triton_linear_fwd_dense(x_mk, w_nk, bias=None, out_dtype=None, BM=128, BN=128, BK=32):
+@triton.jit
+def linear_fwd_kernel(
+    X_ptr, W_ptr, B_ptr, O_ptr,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_om, stride_on,
+    HAS_BIAS: tl.constexpr,
+    OUT_TL_DTYPE: tl.constexpr,   # <- must be tl.float16 / tl.bfloat16 / tl.float32
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    rm = pid_m * BM + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+
+    x_ptrs = X_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk
+    w_ptrs = W_ptr + rn[None, :] * stride_wn + rk[:, None] * stride_wk
+
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+
+    # K is constexpr, so this loop is compile-time unrolled in blocks
+    for k0 in tl.static_range(0, K, BK):
+        k = k0 + rk
+        x = tl.load(
+            x_ptrs + k0 * stride_xk,
+            mask=(rm[:, None] < M) & (k[None, :] < K),
+            other=0.0
+        ).to(tl.float32)
+        w = tl.load(
+            w_ptrs + k0 * stride_wk,
+            mask=(rn[None, :] < N) & (k[:, None] < K),
+            other=0.0
+        ).to(tl.float32)
+
+        acc += tl.dot(x, w)
+
+    if HAS_BIAS:
+        b = tl.load(B_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+        acc += b[None, :]
+
+    o_ptrs = O_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on
+    tl.store(o_ptrs, acc.to(OUT_TL_DTYPE), mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+def triton_linear_fwd_dense_fast(x_mk, w_nk, bias=None, out_dtype=None,
+                                BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+                                GROUP_M=8,
+                                num_warps=8, num_stages=4):
     assert x_mk.is_cuda and w_nk.is_cuda
     M, K = x_mk.shape
     N, K2 = w_nk.shape
@@ -1083,9 +1284,11 @@ def triton_linear_fwd_dense(x_mk, w_nk, bias=None, out_dtype=None, BM=128, BN=12
 
     o = torch.empty((M, N), device=x_mk.device, dtype=out_dtype)
 
-    grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
+    grid_m = triton.cdiv(M, BLOCK_M)
+    grid_n = triton.cdiv(N, BLOCK_N)
+    grid = (grid_m * grid_n * GROUP_M,)  # 1D grid 
 
-    linear_fwd_kernel[grid](
+    linear_fwd_kernel_fast[grid](
         x_mk, w_nk, bias, o,
         M=M, N=N, K=K,
         stride_xm=x_mk.stride(0), stride_xk=x_mk.stride(1),
@@ -1093,8 +1296,10 @@ def triton_linear_fwd_dense(x_mk, w_nk, bias=None, out_dtype=None, BM=128, BN=12
         stride_om=o.stride(0),    stride_on=o.stride(1),
         HAS_BIAS=(bias is not None),
         OUT_TL_DTYPE=out_tl,
-        BM=BM, BN=BN, BK=BK,
-        num_warps=8, num_stages=3,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return o
 
@@ -1195,30 +1400,67 @@ class OptFC1EarlyTriton(nn.Module):
 
         # 2) stats test
         w_aff, b_aff = self._get_stats_affine(x2.device)
+        '''
+        passed_mask = torch_stats_test_ref_exact(y1.float(), cum_sq.float(),\
+        w_aff, b_aff,\
+        n=E, bound=self.test_stat_bound,)
+        '''
         passed_mask = triton_stats_test(
             y1.float(), cum_sq.float(),
             w_aff, b_aff,
             n=E,
             test_stat_bound=self.test_stat_bound,
         )  # bool [M,N]
-        need_tail_row = (~passed_mask).any(dim=1)      # [M] bool
-        idx = need_tail_row.nonzero(as_tuple=False).squeeze(1)  # [M2]
-        M2 = idx.numel()
-        # x: [M,K]
-        x_tail = x[:, E:]               # [M, K_tail]
-        x_tail_compact = x_tail.index_select(0, idx).contiguous()  # [M2, K_tail]
-        # W: [N,K]
-        W_tail = W[:, E:].contiguous()  # [N, K_tail]
-    
-        y2_compact = triton_linear_fwd_dense(
-            x_tail_compact, W_tail, bias=None, out_dtype=y1.dtype,
-            BM=128, BN=128, BK=32
-        )  # [M2, N]
+        #working version below
+        #y = triton_linear_fwd_dense_fast(x, W, b, out_dtype=x.dtype)
+
+        passed = passed_mask.bool()
+
+        # 1) compute active rows/cols
+        row_need = (~passed).any(dim=1)
+        col_need = (~passed).any(dim=0)
+        row_idx = row_need.nonzero(as_tuple=False).squeeze(1)
+        col_idx = col_need.nonzero(as_tuple=False).squeeze(1)
+
+        M, K = x.shape
+        N = W.shape[0]
+        M2, N2 = row_idx.numel(), col_idx.numel()
+
+        # base output = 0 everywhere (passed positions are already correct)
+        out = torch.zeros((M, N), device=x.device, dtype=out_dtype)
+
+        if M2 == 0 or N2 == 0 or E == K:
+            # no tail needed at all
+            out = torch.where(passed, out, y1_mn.to(out_dtype))
+            return out, {"M2": int(M2), "N2": int(N2)}
+
+        # 2) slice tail
+        x_tail = x[:, E:].contiguous()
+        w_tail = W[:, E:].contiguous()
+
+        # 3) compact
+        x_sub = x_tail.index_select(0, row_idx).contiguous()  # [M2, K_tail]
+        w_sub = w_tail.index_select(0, col_idx).contiguous()  # [N2, K_tail]
+
+        # 4) dense tail GEMM using YOUR kernel
+        y2_sub = triton_linear_fwd_dense_fast(
+            x_sub, w_sub, bias=b, out_dtype=out_dtype,
+        )  # [M2, N2]
         torch.cuda.synchronize()
-        y = torch.zeros((x.shape[0], W.shape[0]), device=x.device, dtype=y1.dtype)  # [M,N]
-        y.index_copy_(0, idx, y2_compact)
+
+        # 5) scatter back only where needed (and combine with y1)
+        # (This is a single assignment, but uses advanced indexing which is OK for small M2/N2.)
+        out[row_idx[:, None], col_idx[None, :]] = (
+            y1[row_idx[:, None], col_idx[None, :]].to(out_dtype) + y2_sub
+        )
+                
+        # 6) enforce elementwise pass (in case some cols/rows were active but some elements passed)
+        y = torch.where(passed, torch.zeros_like(out), out)
+
+        #y = torch.where(passed_mask, torch.zeros_like(y1), y1 + y2_sparse_rows)
 
 
+        
         # reshape back
         if len(orig_shape) == 3:
             return y.reshape(B, S, self.out_features)
@@ -1399,13 +1641,14 @@ def main():
     #check_replacement(model)
 
     model1 = replace_opt_fc1_with_early_triton(model)
+    acc1 = eval_piqa(model1, tokenizer, valid_dataset)
+    '''
     model = OPTForCausalLM.from_pretrained(model_name, torch_dtype=dtype).to(device)
     model2 = replace_opt_fc1_with_torch_mylnear(model)
-    acc1 = eval_piqa(model1, tokenizer, valid_dataset)
     print("PIQA validation acc of triton early termination:", acc1)
     acc2 = eval_piqa(model2, tokenizer, valid_dataset)
     print("PIQA validation acc torch early termination:", acc2)
-
+    '''
 
 if __name__ == "__main__":
     main()
